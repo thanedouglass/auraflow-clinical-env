@@ -81,6 +81,7 @@ export class HeadlessAudioEngine {
   // the calmness score is noisy but unchanged.
   private lastCarrierHz = -1;
   private lastBeatHz = -1;
+  private targetSolfeggioFrequency: number | null = null;
 
   private running = false;
 
@@ -167,6 +168,10 @@ export class HeadlessAudioEngine {
     return this.running;
   }
 
+  setTargetFrequency(freq: number): void {
+    this.targetSolfeggioFrequency = freq;
+  }
+
   /**
    * Subscribe to the live telemetry stream. The engine itself pushes every
    * call to `pushCalmness` / `triggerAlphaBump` here so UI consumers can
@@ -227,7 +232,8 @@ export class HeadlessAudioEngine {
     this.lastChimeAt = now;
 
     const ctx = this.ctx;
-    const freq = SOLFEGGIO_FREQUENCIES[this.chimeIndex % SOLFEGGIO_FREQUENCIES.length];
+    const freq =
+      this.targetSolfeggioFrequency ?? SOLFEGGIO_FREQUENCIES[this.chimeIndex % SOLFEGGIO_FREQUENCIES.length];
     this.chimeIndex += 1;
 
     const osc = ctx.createOscillator();

@@ -13,6 +13,11 @@ interface ConnectedDevice {
   transport: BleTransport;
   device: MuseDeviceOption;
   audioEngine: HeadlessAudioEngine;
+  // Set by DeviceSelection's Shift-click backdoor. When true, SomaticMonitor
+  // is driven by a synthetic calmness stream instead of the BLE transport so
+  // the full clinical pipeline (efficacy streak → Phase 1 Biometric dispatch)
+  // can be exercised without a headband.
+  mockMode?: boolean;
 }
 
 export default function App() {
@@ -75,6 +80,7 @@ export default function App() {
           deviceLabel={connected?.device.name}
           audioEngine={connected?.audioEngine}
           baselineScores={baselineScores ?? undefined}
+          mockCalmnessScore={connected?.mockMode ? 0.85 : undefined}
         />
       )}
       {viewMode === 'rppg' && <RppgApp />}

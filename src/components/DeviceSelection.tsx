@@ -53,13 +53,20 @@ const DEVICES: MuseDeviceOption[] = [
   },
 ];
 
-const RADIUS = 2.6;
+// Horizontal slot spacing for the linear carousel. Each device sits at
+// (index - focusedIndex) * SLOT_SPACING on the X axis so unfocused models
+// slide cleanly off-frame instead of overlapping the focused one.
+const SLOT_SPACING = 5;
 
 interface DeviceSelectionProps {
   onConnected: (payload: {
     transport: BleTransport;
     device: MuseDeviceOption;
     audioEngine: HeadlessAudioEngine;
+    // E2E backdoor flag: when true, the parent should drive SomaticMonitor
+    // from a synthetic telemetry stream instead of the transport. Set by the
+    // Shift-click bypass in handleConnect.
+    mockMode?: boolean;
   }) => void;
 }
 
@@ -80,11 +87,9 @@ export const DeviceSelection: React.FC<DeviceSelectionProps> = ({ onConnected })
     setFocusedIndex((prev) => (prev + direction + DEVICES.length) % DEVICES.length);
   };
 
-  const handleConnect = async () => {
+  const handleConnect = async (e: React.MouseEvent<HTMLButtonElement>) => {
     if (status === 'pairing' || status === 'handshaking') return;
     setErrorMessage(null);
-    setStatus('pairing');
-    setIsConnecting(true);
 
     // Construct + unlock the AudioContext synchronously inside the click
     // gesture. Any `await` before `start()` would break the browser's
@@ -93,6 +98,30 @@ export const DeviceSelection: React.FC<DeviceSelectionProps> = ({ onConnected })
     const audioReady = audioEngine.start().catch((err) => {
       console.warn('Audio engine unlock failed; continuing without sound.', err);
     });
+
+    // Shift-click backdoor: skip the Web Bluetooth chooser entirely and
+    // hand a no-op transport to the parent along with mockMode=true. The
+    // parent routes synthetic telemetry into SomaticMonitor so the full
+    // calmness → 3-minute efficacy → Phase 1 Biometric dispatch path runs
+    // without any headband present.
+    if (e.shiftKey) {
+      await audioReady;
+      const mockTransport = {
+        startStreaming: async () => {},
+        stop: async () => {},
+      } as unknown as BleTransport;
+      setStatus('streaming');
+      onConnected({
+        transport: mockTransport,
+        device: focusedDevice,
+        audioEngine,
+        mockMode: true,
+      });
+      return;
+    }
+
+    setStatus('pairing');
+    setIsConnecting(true);
 
     try {
       if (typeof navigator === 'undefined' || !('bluetooth' in navigator)) {
@@ -126,7 +155,7 @@ export const DeviceSelection: React.FC<DeviceSelectionProps> = ({ onConnected })
       // Hand off the live transport + audio engine to the parent —
       // SomaticMonitor will attach `onFrame`, drive the engine, and call
       // `startStreaming()`.
-      onConnected({ transport, device: focusedDevice, audioEngine });
+      onConnected({ transport, device: focusedDevice, audioEngine, mockMode: false });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unknown BLE error';
       setErrorMessage(msg);
@@ -331,7 +360,6 @@ export const DeviceSelection: React.FC<DeviceSelectionProps> = ({ onConnected })
               background: isConnecting
                 ? 'rgba(56, 189, 248, 0.18)'
                 : `linear-gradient(135deg, ${focusedDevice.accent} 0%, rgba(255,255,255,0.12) 200%)`,
-              backgroundColor: 'rgba(56, 189, 248, 0.18)',
               color: '#070a0f',
               fontSize: 14,
               fontWeight: 700,
@@ -368,26 +396,26 @@ interface CarouselProps {
 
 const Carousel: React.FC<CarouselProps> = ({ focusedIndex, onPick }) => {
   const groupRef = useRef<THREE.Group>(null);
-  const targetRotation = useRef(0);
 
-  // Drag-to-swipe support: track pointer X delta and snap to the nearest slot.
-  const dragState = useRef<{ active: boolean; startX: number; startRot: number }>({
+  // Drag-to-swipe support. We translate the whole group on X while the
+  // pointer is down and snap to the next/previous slot on release.
+  const dragState = useRef<{ active: boolean; startX: number; offset: number }>({
     active: false,
     startX: 0,
-    startRot: 0,
+    offset: 0,
   });
-
-  useEffect(() => {
-    targetRotation.current = -(focusedIndex * ((Math.PI * 2) / DEVICES.length));
-  }, [focusedIndex]);
 
   useFrame((_, delta) => {
     if (!groupRef.current) return;
     if (!dragState.current.active) {
-      // Ease toward the snap angle.
-      const current = groupRef.current.rotation.y;
-      const next = THREE.MathUtils.damp(current, targetRotation.current, 6, delta);
-      groupRef.current.rotation.y = next;
+      // Settle the group back to 0 after a release so per-slot offsets
+      // remain the only source of horizontal motion.
+      groupRef.current.position.x = THREE.MathUtils.damp(
+        groupRef.current.position.x,
+        0,
+        6,
+        delta,
+      );
     }
   });
 
@@ -395,59 +423,78 @@ const Carousel: React.FC<CarouselProps> = ({ focusedIndex, onPick }) => {
     <group
       ref={groupRef}
       onPointerDown={(e) => {
-        dragState.current = {
-          active: true,
-          startX: e.clientX,
-          startRot: groupRef.current?.rotation.y ?? 0,
-        };
+        dragState.current = { active: true, startX: e.clientX, offset: 0 };
         (e.target as Element)?.setPointerCapture?.(e.pointerId);
       }}
       onPointerMove={(e) => {
         if (!dragState.current.active || !groupRef.current) return;
         const dx = e.clientX - dragState.current.startX;
-        groupRef.current.rotation.y = dragState.current.startRot + dx * 0.005;
+        dragState.current.offset = dx * 0.012;
+        groupRef.current.position.x = dragState.current.offset;
       }}
       onPointerUp={(e) => {
-        if (!dragState.current.active || !groupRef.current) return;
+        if (!dragState.current.active) return;
+        const { offset } = dragState.current;
         dragState.current.active = false;
         (e.target as Element)?.releasePointerCapture?.(e.pointerId);
-        const slot = (Math.PI * 2) / DEVICES.length;
-        const raw = groupRef.current.rotation.y;
-        const nearestIndex =
-          ((Math.round(-raw / slot) % DEVICES.length) + DEVICES.length) % DEVICES.length;
-        onPick(nearestIndex);
+        // A swipe of >0.6 scene units crosses the snap threshold. Positive
+        // drag (rightwards) reveals the previous slot.
+        const direction = offset > 0.6 ? -1 : offset < -0.6 ? 1 : 0;
+        if (direction !== 0) {
+          onPick(
+            (focusedIndex + direction + DEVICES.length) % DEVICES.length,
+          );
+        }
       }}
     >
-      {DEVICES.map((device, i) => {
-        const angle = (i * Math.PI * 2) / DEVICES.length;
-        const x = Math.sin(angle) * RADIUS;
-        const z = Math.cos(angle) * RADIUS - RADIUS; // pull focused slot toward camera
-        return (
-          <DeviceModel
-            key={device.id}
-            device={device}
-            position={[x, 0, z]}
-            isFocused={i === focusedIndex}
-            onClick={() => onPick(i)}
-          />
-        );
-      })}
+      {DEVICES.map((device, i) => (
+        <DeviceModel
+          key={device.id}
+          device={device}
+          slotOffset={i - focusedIndex}
+          isFocused={i === focusedIndex}
+          onClick={() => onPick(i)}
+        />
+      ))}
     </group>
   );
 };
 
 interface DeviceModelProps {
   device: MuseDeviceOption;
-  position: [number, number, number];
+  // Linear-carousel slot offset relative to the focused index. The model
+  // eases to slotOffset * SLOT_SPACING on the X axis so unfocused devices
+  // slide off-frame instead of overlapping the focused one.
+  slotOffset: number;
   isFocused: boolean;
   onClick: () => void;
 }
 
-const DeviceModel: React.FC<DeviceModelProps> = ({ device, position, isFocused, onClick }) => {
+const DeviceModel: React.FC<DeviceModelProps> = ({ device, slotOffset, isFocused, onClick }) => {
+  const ref = useRef<THREE.Group>(null);
+  const targetX = slotOffset * SLOT_SPACING;
+
+  // Snap to the initial target on mount so off-screen models don't flash
+  // through the focused position before easing begins.
+  useEffect(() => {
+    if (ref.current) ref.current.position.x = targetX;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useFrame((_, delta) => {
+    if (!ref.current) return;
+    ref.current.position.x = THREE.MathUtils.damp(
+      ref.current.position.x,
+      targetX,
+      5,
+      delta,
+    );
+  });
+
   // Try the GLB; if it fails, useGLTF will throw and the ErrorBoundary
   // catches it so the procedural fallback renders.
   return (
-    <group position={position}>
+    <group ref={ref}>
       <Float
         floatIntensity={isFocused ? 0.6 : 0.2}
         rotationIntensity={isFocused ? 0.3 : 0.1}

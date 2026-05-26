@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import type { BleTransport } from '@elata-biosciences/eeg-web-ble';
 import type { HeadbandFrameV1, EegPreprocessor, HeadbandTransportStatus } from '@elata-biosciences/eeg-web';
 import type { HeadlessAudioEngine } from '../utils/HeadlessAudioEngine';
+import { getOptimalSolfeggio } from '../utils/cosineSimilarity';
 import type { PsychometricScores } from '../data/psychometricItems';
 
 /**
@@ -61,9 +62,14 @@ export interface SomaticMonitorProps {
   // overlays (subjective baseline vs measured calmness); not consumed by the
   // current render path.
   baselineScores?: PsychometricScores;
+  // E2E backdoor: when set, skip the BLE + WASM pipeline entirely and tick
+  // a synthetic 1Hz telemetry stream locked to this calmness score. Set by
+  // App.tsx when DeviceSelection's Shift-click bypass fires, so the full
+  // efficacy-streak → Phase 1 Biometric dispatch path runs hardwareless.
+  mockCalmnessScore?: number;
 }
 
-export const SomaticMonitor: React.FC<SomaticMonitorProps> = ({ preparedTransport, deviceLabel, audioEngine, baselineScores: _baselineScores }) => {
+export const SomaticMonitor: React.FC<SomaticMonitorProps> = ({ preparedTransport, deviceLabel, audioEngine, baselineScores: _baselineScores, mockCalmnessScore }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   
@@ -105,6 +111,22 @@ export const SomaticMonitor: React.FC<SomaticMonitorProps> = ({ preparedTranspor
     latestCalmnessScore: 0.5,
     dataBuffer: [],
   });
+
+  useEffect(() => {
+    if (!_baselineScores || !audioEngineRef.current) {
+      return;
+    }
+
+    const baselineVector = [
+      _baselineScores.erq.reappraisal,
+      _baselineScores.erq.suppression,
+      _baselineScores.ders.total,
+    ];
+    const optimalFrequency = getOptimalSolfeggio(baselineVector);
+
+    console.info('[SomaticMonitor] optimal Solfeggio frequency:', optimalFrequency);
+    audioEngineRef.current.setTargetFrequency(optimalFrequency);
+  }, []);
 
   /**
    * Initialize the Elata SDK components
@@ -571,8 +593,32 @@ export const SomaticMonitor: React.FC<SomaticMonitorProps> = ({ preparedTranspor
 
     updateCanvasSize();
 
-    // Initialize SDK
-    initializeSDK();
+    // E2E backdoor: skip the BLE + WASM pipeline entirely and tick a
+    // synthetic stream so the full clinical path (audio engine, telemetry
+    // buffer, efficacy streak, 3-minute Phase 1 Biometric dispatch) runs
+    // without hardware. The buffer is trimmed to the same 60-min @ 1Hz
+    // window as the live path so canvas rendering stays bounded.
+    let mockIntervalId: number | null = null;
+    if (mockCalmnessScore !== undefined) {
+      setState((prev) => ({ ...prev, isConnected: true, isInitializing: false }));
+      mockIntervalId = window.setInterval(() => {
+        const dataPoint: TelemetryDataPoint = {
+          timestamp: Date.now(),
+          calmnessScore: mockCalmnessScore,
+          alphaBumpDetected: false,
+        };
+        audioEngineRef.current?.pushCalmness(dataPoint);
+        setState((prev) => ({
+          ...prev,
+          latestCalmnessScore: mockCalmnessScore,
+          dataBuffer: [...prev.dataBuffer.slice(-3599), dataPoint],
+        }));
+        updateEfficacyStreak(dataPoint);
+      }, 1000);
+    } else {
+      // Initialize SDK
+      initializeSDK();
+    }
 
     // Start animation loop
     animate();
@@ -589,6 +635,10 @@ export const SomaticMonitor: React.FC<SomaticMonitorProps> = ({ preparedTranspor
         cancelAnimationFrame(animationFrameRef.current);
       }
       resizeObserver.disconnect();
+
+      if (mockIntervalId !== null) {
+        window.clearInterval(mockIntervalId);
+      }
 
       // Shutdown BLE transport
       if (bleTransportRef.current) {
