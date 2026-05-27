@@ -47,6 +47,8 @@ interface SessionPayload {
   trackId: string;
   hardwareType: string;
   efficacyDelta: number;
+  trialGroup: 'experimental' | 'sham';
+  environmentCompromised: boolean;
 }
 
 export interface SomaticMonitorProps {
@@ -112,20 +114,52 @@ export const SomaticMonitor: React.FC<SomaticMonitorProps> = ({ preparedTranspor
     dataBuffer: [],
   });
 
+  // RCT and environmental integrity state
+  const [trialGroup, setTrialGroup] = useState<'experimental' | 'sham'>('sham');
+  const [environmentCompromised, setEnvironmentCompromised] = useState<boolean>(false);
+
   useEffect(() => {
     if (!_baselineScores || !audioEngineRef.current) {
       return;
     }
 
-    const baselineVector = [
-      _baselineScores.erq.reappraisal,
-      _baselineScores.erq.suppression,
-      _baselineScores.ders.total,
-    ];
-    const optimalFrequency = getOptimalSolfeggio(baselineVector);
+    // RCT randomization: generate random number
+    const randomValue = Math.random();
+    
+    if (randomValue > 0.5) {
+      // Experimental arm: use optimal Solfeggio frequency
+      setTrialGroup('experimental');
+      const baselineVector = [
+        _baselineScores.erq.reappraisal,
+        _baselineScores.erq.suppression,
+        _baselineScores.ders.total,
+      ];
+      const optimalFrequency = getOptimalSolfeggio(baselineVector);
+      console.info('[SomaticMonitor] RCT experimental arm - optimal Solfeggio frequency:', optimalFrequency);
+      audioEngineRef.current.setTargetFrequency(optimalFrequency);
+    } else {
+      // Sham arm: use static 440 Hz (standard A note)
+      setTrialGroup('sham');
+      console.info('[SomaticMonitor] RCT sham arm - using static 440 Hz');
+      audioEngineRef.current.setTargetFrequency(440);
+    }
+  }, [_baselineScores]);
 
-    console.info('[SomaticMonitor] optimal Solfeggio frequency:', optimalFrequency);
-    audioEngineRef.current.setTargetFrequency(optimalFrequency);
+  /**
+   * Environmental integrity tracker: detect if user minimizes window or switches tabs
+   */
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        console.warn('[SomaticMonitor] Document hidden - environment compromised');
+        setEnvironmentCompromised(true);
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
   }, []);
 
   /**
@@ -236,7 +270,22 @@ export const SomaticMonitor: React.FC<SomaticMonitorProps> = ({ preparedTranspor
   };
 
   const dispatchToEdge = (sessionPayload: SessionPayload) => {
-    console.info('[AntigravityBackend] sessionPayload', JSON.stringify(sessionPayload));
+    const federatedEnvelope = {
+      edgeNodeId: sessionIdRef.current,
+      timestamp: Date.now(),
+      privacyPreserving: true,
+      clinicalControls: {
+        trialGroup: sessionPayload.trialGroup,
+        environmentCompromised: sessionPayload.environmentCompromised,
+      },
+      modelFeedback: {
+        hardwareType: sessionPayload.hardwareType,
+        intervention: 'Solfeggio_Vector_Mapped',
+        efficacyDelta: sessionPayload.efficacyDelta,
+      },
+    };
+
+    console.log('[Federated Edge] Ready for aggregation:', JSON.stringify(federatedEnvelope, null, 2));
   };
 
   const updateEfficacyStreak = (dataPoint: TelemetryDataPoint) => {
@@ -282,6 +331,8 @@ export const SomaticMonitor: React.FC<SomaticMonitorProps> = ({ preparedTranspor
         trackId: 'lyria-supernova-001',
         hardwareType: 'Muse S Athena',
         efficacyDelta: Number((nextPeakScore - streak.baselineScore).toFixed(4)),
+        trialGroup,
+        environmentCompromised,
       };
 
       dispatchToEdge(sessionPayload);

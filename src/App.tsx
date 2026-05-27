@@ -4,10 +4,11 @@ import SomaticMonitor from './components/SomaticMonitor';
 import RppgApp from './components/RppgApp';
 import DeviceSelection, { type MuseDeviceOption } from './components/DeviceSelection';
 import PsychometricIntake from './components/PsychometricIntake';
+import { InductionTask } from './components/InductionTask';
 import type { PsychometricScores } from './data/psychometricItems';
 import type { HeadlessAudioEngine } from './utils/HeadlessAudioEngine';
 
-type ViewMode = 'intake' | 'device-selection' | 'somatic' | 'rppg';
+type ViewMode = 'intake' | 'induction' | 'device-selection' | 'somatic' | 'rppg';
 
 interface ConnectedDevice {
   transport: BleTransport;
@@ -27,10 +28,10 @@ export default function App() {
 
   const handleIntakeComplete = (scores: PsychometricScores) => {
     // Scoring happens silently in the background — we just stash the result
-    // for downstream consumers and move the operator forward to hardware
-    // pairing without an interstitial debrief.
+    // for downstream consumers and move the operator forward to cognitive load
+    // phase (induction) without an interstitial debrief.
     setBaselineScores(scores);
-    setViewMode('device-selection');
+    setViewMode('induction');
   };
 
   const handleConnected = (payload: ConnectedDevice) => {
@@ -41,8 +42,8 @@ export default function App() {
   return (
     <>
       {/* View mode selector — hidden until the operator has paired a device,
-          so the intake + bring-up flow stay uncluttered on first run. */}
-      {viewMode !== 'intake' && viewMode !== 'device-selection' && (
+          so the intake + induction + bring-up flow stay uncluttered on first run. */}
+      {viewMode !== 'intake' && viewMode !== 'induction' && viewMode !== 'device-selection' && (
         <div
           style={{
             position: 'fixed',
@@ -73,6 +74,9 @@ export default function App() {
       )}
 
       {viewMode === 'intake' && <PsychometricIntake onComplete={handleIntakeComplete} />}
+      {viewMode === 'induction' && (
+        <InductionTask onComplete={() => setViewMode('device-selection')} />
+      )}
       {viewMode === 'device-selection' && <DeviceSelection onConnected={handleConnected} />}
       {viewMode === 'somatic' && (
         <SomaticMonitor
